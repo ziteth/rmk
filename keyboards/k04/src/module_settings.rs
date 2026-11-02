@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use embassy_sync::watch::Watch;
 use rmk::event::{PeripheralSettingsEvent, SleepStateEvent};
 use rmk::macros::processor;
-use rmk::split::ble::central::{set_split_link_profile, SplitLinkProfile};
+use rmk::split::ble::central::{SplitLinkProfile, set_split_link_profile};
 
 const VERSION: u8 = if cfg!(feature = "standalone") { 10 } else { 9 };
 const SETTINGS_LEN: usize = 45;
@@ -139,15 +139,20 @@ pub fn ball_cpi(side: u8) -> u16 {
     BALL_DPI_TABLE[idx.min(BALL_DPI_TABLE.len() - 1)]
 }
 
-pub fn scale_touch_delta(value: i16, side: u8) -> i16 {
+/// Scale a fixed-point delta in 1/256-unit steps by the touch DPI setting.
+///
+/// The value is scaled as a whole so its sign and sub-count remainder survive
+/// the truncating division. Scaling whole and fraction parts independently
+/// turns negative deltas positive — a negative value's fraction is positive in
+/// two's complement — which made slow strokes drift down-right.
+pub fn scale_touch_delta_fixed(value: i32, side: u8) -> i32 {
     let idx = byte(if side == 0 {
         IDX_LEFT_TOUCH_DPI
     } else {
         IDX_RIGHT_TOUCH_DPI
     });
-    let touch_dpi = (u16::from(idx.min(9)) + 1) * 100;
-    let scaled = i32::from(value) * i32::from(touch_dpi) / i32::from(TOUCH_DPI_BASE);
-    scaled.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+    let touch_dpi = i32::from((u16::from(idx.min(9)) + 1) * 100);
+    (i64::from(value) * i64::from(touch_dpi) / i64::from(TOUCH_DPI_BASE)) as i32
 }
 
 pub fn touch_gestures_enabled(side: u8) -> bool {

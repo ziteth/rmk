@@ -12,7 +12,7 @@ mod layer_names;
 mod module_settings;
 mod touchpad;
 mod trackball;
-
+use embassy_nrf::gpio::{Input, Pull};
 const DEFAULT_LAYER_NAMES: [&str; 16] = default_layer_names::STANDARD_WITH_MOUSE;
 
 use rmk::macros::rmk_central;
@@ -51,7 +51,20 @@ mod keyboard_central {
     #[register_processor(event)]
     fn trackball() -> crate::trackball::Trackball {
         crate::trackball::Trackball::new_central(
-            crate::trackball::new_trackball_from_pins(0, p.P0_01, p.P0_00, p.P0_05, p.P1_09),
+            crate::trackball::new_trackball_from_pins(
+                0,
+                p.P0_01,
+                p.P0_00,
+                p.P0_05,
+                // The module slot wires the touchpad RDY and the trackball
+                // MOTION lines to the same pin, and a Peri token can only be
+                // moved once, so the second driver steals its own token. Both
+                // drivers configure the pin identically (input with pull-up)
+                // and the module selection guarantees only one of them ever
+                // waits on it, so the duplicate token is never used
+                // concurrently.
+                unsafe { ::embassy_nrf::peripherals::P1_09::steal() },
+            ),
             0,
         )
     }
@@ -71,7 +84,8 @@ mod keyboard_central {
             config,
             TOUCH_TWIM_TX_BUF.init([0; 4]),
         );
-        crate::touchpad::Touchpad::new(2, i2c)
+        let rdy_pin = Input::new(p.P1_09, Pull::Up);
+        crate::touchpad::Touchpad::new(2, i2c, rdy_pin)
     }
 
     #[register_processor(event)]

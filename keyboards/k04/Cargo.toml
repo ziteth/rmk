@@ -14,7 +14,10 @@ autoexamples = false
 [features]
 default = ["standalone"]
 standalone = ["rmk/defmt", "rmk/k04_standalone_timeout_14"]
-usb_debug = ["rmk/usb_log"]
+# The K:04 auto-layer timeout presets without defmt, for builds that use the
+# log-based USB logger instead (rmk's defmt and log are mutually exclusive).
+standalone_timeout_14 = ["rmk/k04_standalone_timeout_14"]
+usb_debug = ["rmk/usb_log", "dep:log"]
 usb_debug_force_ble = ["usb_debug"]
 rtt_diag = ["rmk/rtt_diag"]
 mouse_interval_control = ["rmk/mouse_interval_control"]
@@ -96,6 +99,7 @@ embassy-executor = { version = "0.10", features = [
 ] }
 defmt = "1.0"
 defmt-rtt = "1.0"
+log = { version = "0.4", default-features = false, optional = true }
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 static_cell = "2"
 

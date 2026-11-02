@@ -1443,6 +1443,7 @@ dependencies = [
  "heapless 0.9.2",
  "json",
  "lcd-async",
+ "log",
  "nrf-mpsl",
  "nrf-sdc",
  "panic-probe",

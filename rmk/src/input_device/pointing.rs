@@ -680,6 +680,9 @@ const QUBE_TEXT_THRESHOLD: i32 = 1;
 const QUBE_TOUCH_CLICK_MS: u64 = 40;
 const QUBE_TOUCH_LEFT_BUTTON: u8 = 1 << 0;
 const QUBE_TOUCH_RIGHT_BUTTON: u8 = 1 << 1;
+/// Set by the touchpad on a drag-start press so the processor holds the
+/// buttons until the release event instead of one-shot clicking them.
+const QUBE_TOUCH_DRAG_FLAG: u8 = 0x80;
 #[cfg(feature = "k04_standalone_timeout_14")]
 const QUBE_AUTO_LAYER_TIMEOUT_MS_TABLE: [u32; 14] =
     [50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 750, 1000, 1250, 1500];
@@ -923,6 +926,8 @@ struct QubePointingSideState {
     remainder_x: i32,
     remainder_y: i32,
     text_last_motion_ms: u32,
+    // Touch-gesture buttons currently held open by this side's touchpad drag.
+    touch_buttons: u8,
 }
 
 impl QubePointingSideState {
@@ -933,6 +938,7 @@ impl QubePointingSideState {
             remainder_x: 0,
             remainder_y: 0,
             text_last_motion_ms: 0,
+            touch_buttons: 0,
         }
     }
 
@@ -1130,7 +1136,7 @@ impl<'a> QubePointingModeProcessor<'a> {
         let mut y = 0i16;
         let mut wheel = 0i16;
         let mut pan = 0i16;
-        let mut gesture_buttons = 0u8;
+        let mut touch_buttons = 0i16;
 
         for axis_event in event.axes.iter() {
             match axis_event.axis {
@@ -1138,15 +1144,16 @@ impl<'a> QubePointingModeProcessor<'a> {
                 Axis::Y => y = axis_event.value,
                 Axis::V => wheel = axis_event.value,
                 Axis::H => pan = axis_event.value,
-                Axis::Z if source.kind == QubePointingKind::Touch => {
-                    gesture_buttons = qube_touch_gesture_buttons(axis_event.value)
-                }
+                Axis::Z if source.kind == QubePointingKind::Touch => touch_buttons = axis_event.value,
                 _ => {}
             }
         }
 
-        if gesture_buttons != 0 {
-            self.click(gesture_buttons).await;
+        // The touch gesture channel reports the touchpad's absolute button
+        // state on Z while every other axis stays at zero; motion and scroll
+        // events always move a different axis, so the shape is unambiguous.
+        if source.kind == QubePointingKind::Touch && x == 0 && y == 0 && wheel == 0 && pan == 0 {
+            self.handle_touch_buttons(source.side, touch_buttons).await;
             return;
         }
 
@@ -1169,10 +1176,35 @@ impl<'a> QubePointingModeProcessor<'a> {
             return;
         }
 
+        #[cfg(feature = "usb_log")]
+        if source.kind == QubePointingKind::Touch {
+            // Throttled to 1 Hz: confirms touch motion is flowing from the
+            // split peripheral without flooding the log at the report rate.
+            static LAST_TOUCH_MOTION_LOG_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let now = now_ms_u32();
+            let last = LAST_TOUCH_MOTION_LOG_MS.load(core::sync::atomic::Ordering::Relaxed);
+            if now.wrapping_sub(last) >= 1000
+                && LAST_TOUCH_MOTION_LOG_MS
+                    .compare_exchange(
+                        last,
+                        now,
+                        core::sync::atomic::Ordering::Relaxed,
+                        core::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                info!("touch motion side={} x={} y={}", source.side, x, y);
+            }
+        }
+
         let (mut x, mut y) = rotate_motion(x, y, self.settings.orientation(source));
         let mode = self.mode_for_side(source.side);
-        let buttons = self.keymap.mouse_buttons();
-        let is_touch_drag = source.kind == QubePointingKind::Touch && buttons != 0;
+        let keymap_buttons = self.keymap.mouse_buttons();
+        // Reports always carry the full button state: a drag held by the other
+        // side's touchpad must survive any report this event produces.
+        let buttons = keymap_buttons | self.touch_buttons_held();
+        let is_touch_drag =
+            source.kind == QubePointingKind::Touch && (keymap_buttons | self.sides[source.side].touch_buttons) != 0;
 
         if !is_touch_drag {
             self.sync_auto_layer_for_motion(mode, source, x, y);
@@ -1238,14 +1270,58 @@ impl<'a> QubePointingModeProcessor<'a> {
     }
 
     async fn send_mouse(&self, buttons: u8, x: i16, y: i16, wheel: i16, pan: i16) {
-        let buttons = self.keymap.mouse_buttons() | buttons;
+        let buttons = self.keymap.mouse_buttons() | self.touch_buttons_held() | buttons;
         send_mouse_report(buttons, 0, x, y, wheel, pan).await;
     }
 
     async fn click(&self, buttons: u8) {
         self.send_mouse(buttons, 0, 0, 0, 0).await;
         Timer::after(Duration::from_millis(QUBE_TOUCH_CLICK_MS)).await;
-        send_mouse_report_unchecked(self.keymap.mouse_buttons(), 0, 0, 0, 0).await;
+        send_mouse_report_unchecked(self.keymap.mouse_buttons() | self.touch_buttons_held(), 0, 0, 0, 0).await;
+    }
+
+    /// Buttons currently held open by touchpad drags across both sides.
+    fn touch_buttons_held(&self) -> u8 {
+        self.sides.iter().fold(0, |held, side| held | side.touch_buttons)
+    }
+
+    /// Applies one touch-gesture button-state event. The Z value is the
+    /// touchpad's absolute state: 0 releases a held drag, a plain bitmap is a
+    /// one-shot tap click, and a drag-flagged bitmap presses buttons that stay
+    /// held until the matching release event.
+    async fn handle_touch_buttons(&mut self, side: usize, value: i16) {
+        let raw = value.clamp(0, i16::from(u8::MAX)) as u8;
+        #[cfg(feature = "usb_log")]
+        info!(
+            "touch buttons side={} raw={:#04x} held={:#04x}",
+            side, raw, self.sides[side].touch_buttons
+        );
+        if raw == 0 {
+            if self.sides[side].touch_buttons != 0 {
+                self.sides[side].touch_buttons = 0;
+                #[cfg(feature = "usb_log")]
+                info!("touch drag released side={}", side);
+                send_mouse_report_unchecked(self.keymap.mouse_buttons() | self.touch_buttons_held(), 0, 0, 0, 0).await;
+            }
+            return;
+        }
+
+        let buttons = raw & (QUBE_TOUCH_LEFT_BUTTON | QUBE_TOUCH_RIGHT_BUTTON);
+        if raw & QUBE_TOUCH_DRAG_FLAG != 0 && buttons != 0 {
+            if self.sides[side].touch_buttons != buttons {
+                self.sides[side].touch_buttons = buttons;
+                #[cfg(feature = "usb_log")]
+                info!("touch drag pressed side={} buttons={:#04x}", side, buttons);
+                self.send_mouse(0, 0, 0, 0, 0).await;
+            }
+        } else {
+            let click_buttons = qube_touch_gesture_buttons(value);
+            if click_buttons != 0 {
+                #[cfg(feature = "usb_log")]
+                info!("touch click side={} buttons={:#04x}", side, click_buttons);
+                self.click(click_buttons).await;
+            }
+        }
     }
 
     fn mode_for_side(&self, side: usize) -> QubePointingMode {
@@ -2968,6 +3044,263 @@ mod tests {
                 };
                 assert!(matches!(select(keyboard.run(), scenario).await, Either::Second(())));
             });
+        }
+    }
+
+    // The touch gesture Z channel is an absolute button-state protocol: a
+    // drag-flagged press holds through motion until the release event, while
+    // plain bitmaps stay one-shot tap clicks.
+    #[cfg(all(feature = "split", not(feature = "_no_usb")))]
+    mod touch_button_holds {
+        use rmk_types::connection::UsbState;
+
+        use super::*;
+        use crate::channel::{QueuedReportPayload, USB_REPORT_CHANNEL};
+
+        const DRAG_PRESS: i16 = (QUBE_TOUCH_LEFT_BUTTON | QUBE_TOUCH_DRAG_FLAG) as i16;
+
+        fn button_event(device_id: u8, z: i16) -> PointingEvent {
+            PointingEvent {
+                device_id,
+                axes: [
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::X,
+                        value: 0,
+                    },
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::Y,
+                        value: 0,
+                    },
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::Z,
+                        value: z,
+                    },
+                ],
+            }
+        }
+
+        fn motion_event(device_id: u8, x: i16) -> PointingEvent {
+            PointingEvent {
+                device_id,
+                axes: [
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::X,
+                        value: x,
+                    },
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::Y,
+                        value: 0,
+                    },
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::Z,
+                        value: 0,
+                    },
+                ],
+            }
+        }
+
+        fn scroll_event(device_id: u8, v: i16) -> PointingEvent {
+            PointingEvent {
+                device_id,
+                axes: [
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::H,
+                        value: 0,
+                    },
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::V,
+                        value: v,
+                    },
+                    AxisEvent {
+                        typ: AxisValType::Rel,
+                        axis: Axis::Z,
+                        value: 0,
+                    },
+                ],
+            }
+        }
+
+        fn next_report() -> (u8, i32, i32, i32, i32) {
+            let queued = USB_REPORT_CHANNEL
+                .try_receive()
+                .expect("expected a queued mouse report");
+            let QueuedReportPayload::WideMouse(report) = queued.into_payload() else {
+                panic!("expected a wide mouse report");
+            };
+            (report.buttons, report.x, report.y, report.wheel, report.pan)
+        }
+
+        fn assert_quiet() {
+            assert!(USB_REPORT_CHANNEL.try_receive().is_err(), "unexpected extra report");
+        }
+
+        #[test]
+        fn drag_press_holds_through_motion_until_the_release_event() {
+            block_on(async {
+                let mut data = KeymapData::<1, 1, 5>::new([[[k!(A)]]; 5]);
+                let mut behavior = BehaviorConfig::default();
+                let positional = PositionalConfig::<1, 1>::default();
+                let keymap = KeyMap::new(&mut data, &mut behavior, &positional).await;
+                let mut processor = QubePointingModeProcessor::new(&keymap);
+                crate::state::set_usb_state(UsbState::Configured);
+                USB_REPORT_CHANNEL.clear();
+
+                processor.on_pointing_event(button_event(2, DRAG_PRESS)).await;
+                assert_eq!(next_report(), (1, 0, 0, 0, 0), "drag press must report the held button");
+
+                processor.on_pointing_event(motion_event(2, 5)).await;
+                assert_eq!(next_report(), (1, 5, 0, 0, 0), "drag motion must keep the button held");
+
+                // A paused drag must not time out: only the release event ends it.
+                embassy_time::MockDriver::get().advance(Duration::from_millis(500));
+                assert_quiet();
+
+                processor.on_pointing_event(button_event(2, 0)).await;
+                assert_eq!(next_report(), (0, 0, 0, 0, 0), "release must drop the held button");
+                assert_quiet();
+            });
+        }
+
+        #[test]
+        fn plain_taps_still_click_once() {
+            block_on(async {
+                let mut data = KeymapData::<1, 1, 5>::new([[[k!(A)]]; 5]);
+                let mut behavior = BehaviorConfig::default();
+                let positional = PositionalConfig::<1, 1>::default();
+                let keymap = KeyMap::new(&mut data, &mut behavior, &positional).await;
+                let mut processor = QubePointingModeProcessor::new(&keymap);
+                crate::state::set_usb_state(UsbState::Configured);
+                USB_REPORT_CHANNEL.clear();
+
+                processor
+                    .on_pointing_event(button_event(2, i16::from(QUBE_TOUCH_LEFT_BUTTON)))
+                    .await;
+                assert_eq!(next_report(), (1, 0, 0, 0, 0));
+                assert_eq!(next_report(), (0, 0, 0, 0, 0), "tap click must release by itself");
+                assert_quiet();
+            });
+        }
+
+        #[test]
+        fn tap_click_on_one_side_preserves_the_other_sides_drag() {
+            block_on(async {
+                let mut data = KeymapData::<1, 1, 5>::new([[[k!(A)]]; 5]);
+                let mut behavior = BehaviorConfig::default();
+                let positional = PositionalConfig::<1, 1>::default();
+                let keymap = KeyMap::new(&mut data, &mut behavior, &positional).await;
+                let mut processor = QubePointingModeProcessor::new(&keymap);
+                crate::state::set_usb_state(UsbState::Configured);
+                USB_REPORT_CHANNEL.clear();
+
+                processor.on_pointing_event(button_event(2, DRAG_PRESS)).await;
+                assert_eq!(next_report(), (1, 0, 0, 0, 0));
+
+                processor
+                    .on_pointing_event(button_event(3, i16::from(QUBE_TOUCH_RIGHT_BUTTON)))
+                    .await;
+                assert_eq!(
+                    next_report(),
+                    (3, 0, 0, 0, 0),
+                    "tap click must merge with the held drag"
+                );
+                assert_eq!(next_report(), (1, 0, 0, 0, 0), "click release must keep the other drag");
+
+                processor.on_pointing_event(button_event(2, 0)).await;
+                assert_eq!(next_report(), (0, 0, 0, 0, 0));
+                assert_quiet();
+            });
+        }
+
+        #[test]
+        fn repeated_drag_press_does_not_repeat_the_report() {
+            block_on(async {
+                let mut data = KeymapData::<1, 1, 5>::new([[[k!(A)]]; 5]);
+                let mut behavior = BehaviorConfig::default();
+                let positional = PositionalConfig::<1, 1>::default();
+                let keymap = KeyMap::new(&mut data, &mut behavior, &positional).await;
+                let mut processor = QubePointingModeProcessor::new(&keymap);
+                crate::state::set_usb_state(UsbState::Configured);
+                USB_REPORT_CHANNEL.clear();
+
+                processor.on_pointing_event(button_event(2, DRAG_PRESS)).await;
+                processor.on_pointing_event(button_event(2, DRAG_PRESS)).await;
+                assert_eq!(next_report(), (1, 0, 0, 0, 0));
+                assert_quiet();
+
+                processor.on_pointing_event(button_event(2, 0)).await;
+                assert_eq!(next_report(), (0, 0, 0, 0, 0));
+            });
+        }
+
+        #[test]
+        fn drag_reports_carry_the_held_buttons_into_scroll() {
+            block_on(async {
+                let mut data = KeymapData::<1, 1, 5>::new([[[k!(A)]]; 5]);
+                let mut behavior = BehaviorConfig::default();
+                let positional = PositionalConfig::<1, 1>::default();
+                let keymap = KeyMap::new(&mut data, &mut behavior, &positional).await;
+                let mut processor = QubePointingModeProcessor::new(&keymap);
+                crate::state::set_usb_state(UsbState::Configured);
+                USB_REPORT_CHANNEL.clear();
+
+                processor.on_pointing_event(button_event(3, DRAG_PRESS)).await;
+                assert_eq!(next_report(), (1, 0, 0, 0, 0));
+
+                processor.on_pointing_event(scroll_event(3, 3)).await;
+                assert_eq!(next_report(), (1, 0, 0, 3, 0), "scroll must not drop the held button");
+
+                processor.on_pointing_event(button_event(3, 0)).await;
+                assert_eq!(next_report(), (0, 0, 0, 0, 0));
+            });
+        }
+
+        #[test]
+        fn drag_motion_never_activates_the_auto_layer() {
+            block_on(async {
+                let mut data = KeymapData::<1, 1, 5>::new([[[k!(A)]]; 5]);
+                let mut behavior = BehaviorConfig::default();
+                let positional = PositionalConfig::<1, 1>::default();
+                let keymap = KeyMap::new(&mut data, &mut behavior, &positional).await;
+                let mut processor = QubePointingModeProcessor::new(&keymap);
+                let mut settings = packet();
+                settings.0[1] = 4 << 4;
+                processor.on_peripheral_settings_event(settings).await;
+                crate::state::set_usb_state(UsbState::Configured);
+                USB_REPORT_CHANNEL.clear();
+
+                processor.on_pointing_event(button_event(2, DRAG_PRESS)).await;
+                assert_eq!(next_report(), (1, 0, 0, 0, 0));
+                processor.on_pointing_event(motion_event(2, 32)).await;
+                assert_eq!(next_report(), (1, 32, 0, 0, 0));
+                assert!(!keymap.is_layer_active(4), "drag motion must not arm the auto layer");
+
+                // Ordinary ball motion still owns the auto layer.
+                processor.on_pointing_event(motion_event(0, 32)).await;
+                assert_eq!(next_report(), (1, 32, 0, 0, 0), "ball motion must merge the held drag");
+                assert!(keymap.is_layer_active(4));
+
+                processor.on_pointing_event(button_event(2, 0)).await;
+                assert_eq!(next_report(), (0, 0, 0, 0, 0));
+            });
+        }
+
+        fn packet() -> PeripheralSettingsEvent {
+            let mut bytes = [0; 27];
+            bytes[0] = QUBE_SETTINGS_VERSION;
+            bytes[1] = 4 << 4;
+            bytes[5..=10].copy_from_slice(&[8, 4, 16, 8, 4, 16]);
+            bytes[11] = 0xc0;
+            bytes[12] = 1;
+            bytes[26] = QUBE_DEFAULT_AUTO_LAYER_TIMEOUT_INDEX << 4;
+            PeripheralSettingsEvent(bytes)
         }
     }
 

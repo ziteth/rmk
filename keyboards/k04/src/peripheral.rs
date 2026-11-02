@@ -9,7 +9,7 @@ mod touchpad;
 mod trackball;
 #[cfg(feature = "right_uf2_cleanup")]
 mod uf2_usb_cleanup;
-
+use embassy_nrf::gpio::{Input, Pull};
 use rmk::macros::rmk_peripheral;
 
 #[rmk_peripheral(id = 0)]
@@ -36,16 +36,29 @@ mod keyboard_peripheral {
     #[register_processor(event)]
     fn trackball() -> crate::trackball::Trackball {
         crate::trackball::Trackball::new_peripheral(
-            crate::trackball::new_trackball_from_pins(1, p.P0_01, p.P0_00, p.P0_05, p.P1_09),
+            crate::trackball::new_trackball_from_pins(
+                1,
+                p.P0_01,
+                p.P0_00,
+                p.P0_05,
+                // The module slot wires the touchpad RDY and the trackball
+                // MOTION lines to the same pin, and a Peri token can only be
+                // moved once, so the second driver steals its own token. Both
+                // drivers configure the pin identically (input with pull-up)
+                // and the module selection guarantees only one of them ever
+                // waits on it, so the duplicate token is never used
+                // concurrently.
+                unsafe { ::embassy_nrf::peripherals::P1_09::steal() },
+            ),
             1,
         )
     }
 
-    #[cfg(feature = "rtt_diag")]
-    #[register_processor(event)]
-    fn rtt_scheduler_probe() -> crate::trackball::RttSchedulerProbe {
-        crate::trackball::RttSchedulerProbe::new()
-    }
+    // #[cfg(feature = "rtt_diag")]
+    // #[register_processor(event)]
+    // fn rtt_scheduler_probe() -> crate::trackball::RttSchedulerProbe {
+    //     crate::trackball::RttSchedulerProbe::new()
+    // }
 
     #[register_processor(event)]
     fn touchpad() -> crate::touchpad::Touchpad {
@@ -62,7 +75,8 @@ mod keyboard_peripheral {
             config,
             TOUCH_TWIM_TX_BUF.init([0; 4]),
         );
-        crate::touchpad::Touchpad::new(3, i2c)
+        let rdy_pin = Input::new(p.P1_09, Pull::Up);
+        crate::touchpad::Touchpad::new(3, i2c, rdy_pin)
     }
 
     #[register_processor(event)]

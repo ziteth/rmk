@@ -13,6 +13,21 @@ use rmk::types::connection::{ConnectionStatus, ConnectionType};
 
 use crate::module_settings::{self, Rgb};
 
+/// LED traces use defmt formatting, which is only linked in the defmt-enabled
+/// builds (standalone, qube-half); they compile out elsewhere.
+#[cfg(any(feature = "standalone", feature = "qube-half"))]
+macro_rules! led_log {
+    ($s:literal $(, $arg:expr)* $(,)?) => {
+        ::defmt::info!($s $(, $arg)*)
+    };
+}
+#[cfg(not(any(feature = "standalone", feature = "qube-half")))]
+macro_rules! led_log {
+    ($s:literal $(, $arg:expr)* $(,)?) => {
+        let _ = ($( &$arg ),*);
+    };
+}
+
 const LED_COUNT: usize = 1;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LOW_BATTERY_MAX: u8 = 20;
@@ -254,7 +269,7 @@ impl LayerLed {
         }
         self.split_state = state;
         self.indicator_phase_started = now;
-        defmt::info!("[SPLIT_LED_V15] side={} source={} state={:?}", self.side, source, state);
+        led_log!("[SPLIT_LED_V15] side={} source={} state={:?}", self.side, source, state);
         if state == SplitConnectionState::Connected {
             self.start_overlay(Overlay::SplitConnected, indicator_duration());
         } else {
@@ -304,7 +319,7 @@ impl LayerLed {
         let vbus_status = crate::battery_nrf::usb_power_status();
         if self.last_vbus_status != Some(vbus_status) {
             self.last_vbus_status = Some(vbus_status);
-            defmt::info!(
+            led_log!(
                 "[VBUS_V17] side={} vbus={} outputrdy={} effective={}",
                 self.side,
                 vbus_status.0,
@@ -320,7 +335,7 @@ impl LayerLed {
             return;
         }
         self.current_color = Some(color);
-        defmt::info!(
+        led_log!(
             "[LED_V15] side={} reason={} split={:?} rgb=({},{},{})",
             self.side,
             reason,
